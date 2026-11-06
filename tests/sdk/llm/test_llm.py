@@ -2296,3 +2296,46 @@ def test_proxy_routing_for_vendor_prefixed_model():
         "model": "anthropic/claude-sonnet-4-5-20250929",
         "api_base": "https://api.anthropic.com",
     }
+
+
+class TestTokenCountDependsOnWholeRequest:
+    """Tests for LLM.token_count_depends_on_whole_request.
+
+    Callers bound a growing conversation's token count from its messages, which
+    only works where a message's count does not depend on the rest of the
+    request. This property is what tells them.
+    """
+
+    def test_unset_for_a_plain_chat_model(self):
+        llm = LLM(model="gpt-4o", usage_id="t")
+
+        assert llm.token_count_depends_on_whole_request is False
+
+    def test_set_when_tool_calls_are_rewritten_into_the_prompt(self):
+        # Non-native tool calling rewrites tool calls into prompt text, and
+        # only when tool schemas are passed, so counting a message alone and
+        # counting it inside a request disagree by more than framing.
+        llm = LLM(model="gpt-4o", usage_id="t", native_tool_calling=False)
+
+        assert llm.token_count_depends_on_whole_request is True
+
+    def test_set_when_messages_are_serialized_as_strings(self):
+        # A text-only message serializes as a string, so one message's content
+        # decides the form of the message it merges into: adding an image
+        # re-serializes text that was already counted.
+        llm = LLM(model="gpt-4o", usage_id="t", force_string_serializer=True)
+
+        assert llm.token_count_depends_on_whole_request is True
+
+    def test_follows_the_model_when_string_serialization_is_not_set(self):
+        # The field defaults to None and the model's own features decide, so
+        # the property has to read the effective value rather than the field.
+        llm = LLM(model="gpt-4o", usage_id="t")
+        assert llm.force_string_serializer is None
+
+        with patch.object(
+            LLM,
+            "_model_features",
+            return_value=SimpleNamespace(force_string_serializer=True),
+        ):
+            assert llm.token_count_depends_on_whole_request is True

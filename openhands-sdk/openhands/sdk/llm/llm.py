@@ -3237,6 +3237,36 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         )
         return self._build_responses_payload(msgs)
 
+    @property
+    def token_count_depends_on_whole_request(self) -> bool:
+        """Whether a message's token count depends on the rest of the request.
+
+        Three ways of counting break a message's independence. A chat template
+        renders a whole conversation in one pass. Non-native tool calling
+        rewrites tool calls into prompt text, and only when tool schemas are
+        passed, so a message counted alone and the same message counted inside
+        a request disagree by more than framing. Forced string serialization
+        serializes a text-only message as a string, and one message's content
+        decides the form of the message it is merged into, so adding an image
+        re-serializes text that was already counted.
+
+        A caller that bounds a conversation's count from its messages must
+        count the conversation in full when this is set. It is set for anything
+        this property cannot vouch for, so an unrecognized LLM loses such a
+        bound rather than its correctness.
+        """
+        if not self.native_tool_calling:
+            return True
+        forced = self.force_string_serializer
+        if forced is None:
+            forced = self._model_features().force_string_serializer
+        if forced:
+            return True
+        return (
+            chat_template_tokenizer(self._chat_template_tokenizer or self._tokenizer)
+            is not None
+        )
+
     def get_token_count(
         self,
         messages: list[Message],

@@ -3,7 +3,7 @@ from collections.abc import Sequence
 from enum import Enum
 from typing import Final
 
-from pydantic import Field, model_validator
+from pydantic import Field, PrivateAttr, model_validator
 
 from openhands.sdk.context.condenser.base import (
     CondensationRequirement,
@@ -11,8 +11,8 @@ from openhands.sdk.context.condenser.base import (
     RollingCondenser,
 )
 from openhands.sdk.context.condenser.utils import (
+    ViewTokenCounter,
     get_suffix_length_for_token_reduction,
-    get_total_token_count,
 )
 from openhands.sdk.context.prompts import render_template
 from openhands.sdk.context.view import View
@@ -63,6 +63,10 @@ class LLMSummarizingCondenser(RollingCondenser):
     llm: LLM
     max_size: int = Field(default=240, gt=0)
     max_tokens: int | None = None
+
+    # Per-instance count cache. Private, so it is neither serialized nor
+    # compared: it is derived from the view and rebuilt on demand.
+    _token_counter: ViewTokenCounter = PrivateAttr(default_factory=ViewTokenCounter)
 
     keep_first: int = Field(default=2, ge=0)
     """Minimum number of events to preserve at the start of the view. The first
@@ -159,8 +163,10 @@ class LLMSummarizingCondenser(RollingCondenser):
         # Reason 2: Token limit is provided and exceeded.
         max_tokens = self._effective_max_tokens(agent_llm)
         if max_tokens is not None and agent_llm is not None:
-            total_tokens = get_total_token_count(view.events, agent_llm)
-            if total_tokens > max_tokens:
+            total_tokens = self._token_counter.count_if_above(
+                view.events, agent_llm, max_tokens
+            )
+            if total_tokens is not None:
                 logger.info(
                     "Condenser token limit exceeded: total_tokens=%d max_tokens=%d "
                     "events=%d",
@@ -316,7 +322,7 @@ class LLMSummarizingCondenser(RollingCondenser):
             assert max_tokens is not None
             assert agent_llm is not None
 
-            total_tokens = get_total_token_count(view.events, agent_llm)
+            total_tokens = self._token_counter.exact_count(view.events, agent_llm)
             tokens_to_reduce = total_tokens - (max_tokens // 2)
 
             suffix_events_to_keep.add(

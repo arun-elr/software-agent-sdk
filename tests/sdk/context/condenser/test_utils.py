@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from openhands.sdk.context.condenser.utils import (
+    ViewTokenCounter,
     get_shortest_prefix_above_token_count,
     get_suffix_length_for_token_reduction,
     get_total_token_count,
@@ -308,3 +309,254 @@ class TestGetSuffixLengthForTokenReduction:
         )
         assert "system-like prefix" in counted_text
         assert "kept user request" in counted_text
+
+
+def _framed_token_count(messages, **_kwargs) -> int:
+    """Per-message framing and per-request priming, as real counters charge."""
+    total = 3
+    for message in messages:
+        total += 3
+        for content in message.content:
+            total += len(getattr(content, "text", "")) // 4
+    return total
+
+
+class _StubLLM:
+    """The parts of ``LLM`` that token counting touches.
+
+    ``ViewTokenCounter`` bounds a view from its parts, and that bound only has
+    slack because a standalone count repeats framing a combined count charges
+    once, so this charges framing rather than counting characters alone. It
+    also keeps ``LLM``'s snapshot and equality behaviour, which decide whether
+    a cached count still applies, instead of a mock's identity comparison.
+    """
+
+    def __init__(self, scale: int = 1, depends_on_whole_request: bool = False):
+        self.scale = scale
+        self.token_count_depends_on_whole_request = depends_on_whole_request
+        self.calls = 0
+        # When set, every count returns this, standing in for a tokenizer that
+        # fails and reports 0.
+        self.counts: int | None = None
+
+    def get_token_count(self, messages, **kwargs) -> int:
+        self.calls += 1
+        if self.counts is not None:
+            return self.counts
+        return self.scale * _framed_token_count(messages, **kwargs)
+
+    def model_copy(self) -> "_StubLLM":
+        return _StubLLM(self.scale, self.token_count_depends_on_whole_request)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _StubLLM) and (
+            self.scale,
+            self.token_count_depends_on_whole_request,
+        ) == (other.scale, other.token_count_depends_on_whole_request)
+
+    def __hash__(self) -> int:
+        return hash((self.scale, self.token_count_depends_on_whole_request))
+
+
+@pytest.fixture
+def framed_llm() -> LLM:
+    return cast(LLM, _StubLLM())
+
+
+def _events(count: int, text: str = "some event text here") -> list:
+    return [
+        SystemPromptEvent(
+            source="agent", system_prompt=TextContent(text="system"), tools=[]
+        ),
+        *(message_event(f"{i} {text}") for i in range(count)),
+    ]
+
+
+class TestViewTokenCounter:
+    """Tests for ViewTokenCounter."""
+
+    def test_skips_the_recount_while_the_view_stays_under_the_cap(
+        self, framed_llm: LLM
+    ):
+        counter = ViewTokenCounter()
+        events = _events(4)
+        assert counter.count_if_above(events, framed_llm, 10_000) is None
+        calls_after_baseline = framed_llm.calls  # type: ignore
+
+        for _ in range(20):
+            events.append(message_event("another step"))
+            assert counter.count_if_above(events, framed_llm, 10_000) is None
+
+        # Each step counts only the event it appended, never the whole view.
+        extra = framed_llm.calls - calls_after_baseline  # type: ignore
+        assert extra == 20
+
+    def test_reports_the_exact_count_once_the_view_passes_the_cap(
+        self, framed_llm: LLM
+    ):
+        counter = ViewTokenCounter()
+        events = _events(40)
+
+        reported = counter.count_if_above(events, framed_llm, 50)
+
+        assert reported == get_total_token_count(events, framed_llm)
+        assert reported is not None and reported > 50
+
+    def test_counts_an_unchanged_view_once(self, framed_llm: LLM):
+        counter = ViewTokenCounter()
+        events = _events(4)
+        # Counted up front, so this assertion's own count is not one of the
+        # calls the test then counts.
+        expected = get_total_token_count(events, framed_llm)
+
+        first = counter.exact_count(events, framed_llm)
+        calls = framed_llm.calls  # type: ignore
+        second = counter.exact_count(events, framed_llm)
+
+        assert first == second == expected
+        assert framed_llm.calls == calls  # type: ignore
+
+    def test_recounts_when_the_view_no_longer_extends_the_counted_events(
+        self, framed_llm: LLM
+    ):
+        counter = ViewTokenCounter()
+        events = _events(10)
+        counter.exact_count(events, framed_llm)
+
+        # A condensation drops events from the middle, so the view is no longer
+        # an extension of what was counted and nothing can be counted up from.
+        condensed = events[:2] + events[6:]
+
+        assert counter.exact_count(condensed, framed_llm) == get_total_token_count(
+            condensed, framed_llm
+        )
+
+    def test_shorter_view_does_not_reuse_the_longer_counted_total(
+        self, framed_llm: LLM
+    ):
+        counter = ViewTokenCounter()
+        events = _events(20)
+        counter.exact_count(events, framed_llm)
+
+        truncated = events[:5]
+
+        assert counter.count_if_above(truncated, framed_llm, 1) == (
+            get_total_token_count(truncated, framed_llm)
+        )
+
+    def test_always_recounts_when_counting_uses_a_chat_template(self, framed_llm: LLM):
+        # A chat template renders the whole conversation, so a part of it does
+        # not bound the whole and the view must be counted in full every time.
+        framed_llm.uses_chat_template_token_count = True  # type: ignore
+        counter = ViewTokenCounter()
+        events = _events(4)
+        counter.count_if_above(events, framed_llm, 10_000)
+
+        calls = framed_llm.calls  # type: ignore
+        events.append(message_event("another step"))
+        counter.count_if_above(events, framed_llm, 10_000)
+
+        # One more whole-view count, not a single-event count added to a bound.
+        assert framed_llm.calls == calls + 1  # type: ignore
+
+    def test_recounts_when_an_appended_event_cannot_be_counted(self, framed_llm: LLM):
+        # LLM.get_token_count returns 0 when tokenization fails. Trusting that
+        # as the event's size would put the bound under the true count and let
+        # the view pass the cap unnoticed, so the view is counted instead.
+        counter = ViewTokenCounter()
+        events = _events(2)
+        assert counter.count_if_above(events, framed_llm, 10_000) is None
+
+        big = message_event("x" * 80_000)
+        events.append(big)
+        stub = cast(_StubLLM, framed_llm)
+        real = stub.get_token_count
+
+        def fail_on_the_new_event_alone(messages, **kwargs):
+            if len(messages) == 1 and "x" * 80_000 in str(messages[0].content):
+                stub.calls += 1
+                return 0
+            return real(messages, **kwargs)
+
+        stub.get_token_count = fail_on_the_new_event_alone  # type: ignore[method-assign]
+
+        reported = counter.count_if_above(events, framed_llm, 10_000)
+
+        assert reported is not None and reported > 10_000
+
+    def test_does_not_build_on_a_count_that_failed(self, framed_llm: LLM):
+        # LLM.get_token_count returns 0 when tokenization fails, so a whole-view
+        # count can come back as 0. Caching that as the baseline would hold the
+        # view under every cap for as long as it stayed cached, even after
+        # tokenization recovered.
+        counter = ViewTokenCounter()
+        events = _events(40)
+        stub = cast(_StubLLM, framed_llm)
+        stub.counts = 0
+
+        assert counter.count_if_above(events, framed_llm, 50) is None
+
+        stub.counts = None
+        reported = counter.count_if_above(events, framed_llm, 50)
+
+        assert reported == get_total_token_count(events, framed_llm)
+
+    def test_does_not_reuse_a_count_taken_with_a_different_llm(self, framed_llm: LLM):
+        # A count belongs to the tokenizer that produced it.
+        counter = ViewTokenCounter()
+        events = _events(4)
+        counter.exact_count(events, framed_llm)
+
+        verbose = cast(LLM, _StubLLM(scale=10))
+
+        assert counter.exact_count(events, verbose) == get_total_token_count(
+            events, verbose
+        )
+
+    def test_does_not_track_events_a_condensation_dropped(self, framed_llm: LLM):
+        # A condensation that keeps the counted events but replaces what follows
+        # leaves a running sum describing events no longer in the view.
+        counter = ViewTokenCounter()
+        events = _events(2)
+        counter.exact_count(events, framed_llm)
+        for index in range(30):
+            events.append(message_event(f"step {index}"))
+            counter.count_if_above(events, framed_llm, 10_000)
+            if index % 5 == 4:
+                events = events[:3] + events[-2:]
+                counter.count_if_above(events, framed_llm, 10_000)
+
+        # Only the events past the counted ones are tracked, so the bookkeeping
+        # follows the view's size and not the run's.
+        assert len(counter._pending_ids) == len(events) - len(counter._counted_ids)
+        assert len(counter._pending_ids) <= len(events)
+
+    def test_does_not_reuse_a_count_after_a_counting_setting_changes(
+        self, framed_llm: LLM
+    ):
+        # An LLM's settings are mutable, so a count is kept against a snapshot
+        # of the LLM rather than its identity. Changing a setting that moves
+        # token counts drops the count instead of reusing it.
+        counter = ViewTokenCounter()
+        events = _events(4)
+        before = counter.exact_count(events, framed_llm)
+
+        cast(_StubLLM, framed_llm).scale = 10
+
+        after = counter.exact_count(events, framed_llm)
+
+        assert after == get_total_token_count(events, framed_llm)
+        assert after != before
+
+    @pytest.mark.parametrize("cap", [1, 40, 120, 400, 10_000])
+    def test_decides_exactly_as_a_plain_recount_does(self, framed_llm: LLM, cap: int):
+        """The cached path must agree with get_total_token_count at every step."""
+        counter = ViewTokenCounter()
+        events = _events(0)
+        for step in range(30):
+            events.append(message_event(f"step {step} " + "body " * (step % 7)))
+            if step and step % 11 == 0:
+                events = events[:2] + events[5:]
+            total = get_total_token_count(events, framed_llm)
+            expected = total if total > cap else None
+            assert counter.count_if_above(events, framed_llm, cap) == expected
